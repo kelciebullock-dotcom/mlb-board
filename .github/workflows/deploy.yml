@@ -1,0 +1,65 @@
+name: Build and deploy MLB board
+
+# When this runs:
+#  - every day on a schedule (see cron below)
+#  - whenever you push changes to the repo
+#  - manually, via the "Run workflow" button on the Actions tab
+on:
+  schedule:
+    # 15:00 UTC = 11:00 AM ET (daylight time) / 10:00 AM ET (standard time).
+    # Cron is always in UTC. Adjust the hour if you want a different ET time.
+    # Runs after morning probable pitchers/odds are usually posted.
+    - cron: "0 15 * * *"
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}   # the manual "Run workflow" button
+
+# Let the workflow publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# If a run is already going, let the newest one win.
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build the dashboard into ./site
+        env:
+          # Your API key comes from a repository Secret named BALLDONTLIE_API_KEY.
+          # It is never printed and never stored in the repo.
+          BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
+          OUTPUT_DIR: site
+        run: python generate_dashboard.py
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
