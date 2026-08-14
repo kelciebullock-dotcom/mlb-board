@@ -39,17 +39,16 @@ def format_first_pitch(game_date_utc):
 
 def find_bdl_game_id(bdl_games, home_team_name, away_team_name):
     """Return the balldontlie game id whose teams match a Stats API game, so we
-    can request that game's player props. Same fuzzy name match as the odds."""
-    def norm(s):
-        return (s or "").lower().replace("é", "e")
-    hn, an = norm(home_team_name), norm(away_team_name)
-    for g in bdl_games:
-        h = norm(g.get("home_team_name") or g.get("home_team", {}).get("name"))
-        a = norm(g.get("away_team_name") or g.get("away_team", {}).get("name"))
-        home_match = h and (h in hn or hn in h or h.split()[-1] == hn.split()[-1])
-        away_match = a and (a in an or an in a or a.split()[-1] == an.split()[-1])
-        if home_match and away_match:
-            return g.get("id")
+    can request that game's player props. Uses the same canonical-name matcher
+    as the odds, so 'New York Yankees' resolves to balldontlie's 'Yankees' and
+    'Red Sox' never collides with 'White Sox'."""
+    try:
+        from mlb_odds import _game_matches
+        for g in bdl_games:
+            if _game_matches(g, home_team_name, away_team_name):
+                return g.get("id")
+    except Exception:
+        pass
     return None
 
 
