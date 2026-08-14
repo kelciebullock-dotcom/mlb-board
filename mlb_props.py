@@ -49,24 +49,33 @@ def get_player_props(game_id):
 def get_season_rates(player_ids, season):
     """Fetch season stats for a set of players and reduce to simple per-game
     (or per-start) rates we can compare against prop lines. Returns
-    {player_id: {rate_key: value}}."""
+    {player_id: {rate_key: value}}. Also returns a {player_id: full_name} map
+    so callers can show real names instead of numeric IDs."""
     if not player_ids:
-        return {}
+        return {}, {}
     rates = {}
+    names = {}
     # balldontlie paginates; request in one page up to 100 ids at a time.
     ids = list(player_ids)
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
-        params = {"season": season, "per_page": 100}
-        params["player_ids[]"] = chunk
+        # NOTE: balldontlie expects repeated player_ids[]=1&player_ids[]=2 style.
+        # requests encodes a list value under a key ending in [] exactly that way.
+        params = [("season", season), ("per_page", 100)]
+        params += [("player_ids[]", pid) for pid in chunk]
         resp = requests.get(f"{BDL_BASE}/season_stats", headers=_headers(),
                             params=params, timeout=20)
         if resp.status_code != 200:
             continue
         for s in resp.json().get("data", []):
-            pid = s.get("player", {}).get("id")
+            player = s.get("player", {})
+            pid = player.get("id")
             if pid is None:
                 continue
+            full = player.get("full_name") or \
+                (f'{player.get("first_name","")} {player.get("last_name","")}'.strip())
+            if full:
+                names[pid] = full
             gp = s.get("batting_gp") or 0
             gs = s.get("pitching_gs") or 0
             rates[pid] = {
@@ -77,7 +86,33 @@ def get_season_rates(player_ids, season):
                 "runs_per_game": (s.get("batting_r", 0) / gp) if gp else None,
                 "rbi_per_game": (s.get("batting_rbi", 0) / gp) if gp else None,
             }
-    return rates
+    return rates, names
+
+
+def get_player_names(player_ids):
+    """Authoritative name lookup from /players. Season stats miss players with
+    no stats yet (call-ups, pitchers with no prop-relevant batting line), so we
+    use this to fill any names those didn't resolve. Returns {id: full_name}."""
+    if not player_ids:
+        return {}
+    names = {}
+    ids = list(player_ids)
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        params = [("per_page", 100)] + [("player_ids[]", pid) for pid in chunk]
+        resp = requests.get(f"{BDL_BASE}/players", headers=_headers(),
+                            params=params, timeout=20)
+        if resp.status_code != 200:
+            continue
+        for p in resp.json().get("data", []):
+            pid = p.get("id")
+            if pid is None:
+                continue
+            full = p.get("full_name") or \
+                (f'{p.get("first_name","")} {p.get("last_name","")}'.strip())
+            if full:
+                names[pid] = full
+    return names
 
 
 def build_prop_leans(game_id, season, player_name_lookup=None):
@@ -89,7 +124,15 @@ def build_prop_leans(game_id, season, player_name_lookup=None):
         return []
 
     player_ids = {p.get("player_id") for p in props if p.get("player_id")}
-    rates = get_season_rates(player_ids, season)
+    rates, names = get_season_rates(player_ids, season)
+
+    # Fill any names the season-stats call didn't resolve, using /players.
+    missing = [pid for pid in player_ids if pid not in names]
+    if missing:
+        names.update(get_player_names(missing))
+    if player_name_lookup:
+        # caller-supplied names win if provided
+        names.update({k: v for k, v in player_name_lookup.items() if v})
 
     leans = []
     for p in props:
@@ -113,18 +156,16 @@ def build_prop_leans(game_id, season, player_name_lookup=None):
                 if abs(diff) >= max(0.15 * line, 0.3):
                     lean = "OVER" if diff > 0 else "UNDER"
 
-        name = None
-        if player_name_lookup:
-            name = player_name_lookup.get(pid)
-
+        market = p.get("market") or {}
         leans.append({
             "player_id": pid,
-            "player": name or f"Player {pid}",
+            "player": names.get(pid) or (f"Player {pid}" if pid else "Unknown"),
             "prop_type": prop_type,
             "line": line,
             "vendor": p.get("vendor"),
-            "over_odds": (p.get("market") or {}).get("over_odds"),
-            "under_odds": (p.get("market") or {}).get("under_odds"),
+            "over_odds": market.get("over_odds"),
+            "under_odds": market.get("under_odds"),
+            "odds": market.get("odds"),  # milestone-type markets use this
             "model_estimate": estimate,
             "diff": diff,
             "lean": lean,
@@ -133,3 +174,4 @@ def build_prop_leans(game_id, season, player_name_lookup=None):
     # Surface the strongest leans first; lines-only rows sink to the bottom.
     leans.sort(key=lambda r: (r["lean"] == "—", -abs(r["diff"] or 0)))
     return leans
+
