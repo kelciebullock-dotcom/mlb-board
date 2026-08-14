@@ -65,11 +65,30 @@ def get_games_for_date(date_str):
 def get_odds_for_date(date_str):
     """Return moneyline/spread/total odds for all games on a date, grouped by
     balldontlie game_id. Averages moneylines across sportsbooks (vendors) so a
-    single book's outlier doesn't skew the market estimate."""
-    resp = requests.get(f"{BDL_BASE}/odds", headers=_headers(),
-                        params={"dates": date_str, "per_page": 100}, timeout=20)
-    resp.raise_for_status()
-    rows = resp.json().get("data", [])
+    single book's outlier doesn't skew the market estimate.
+
+    Handles pagination: a full slate (many games x several books) can exceed one
+    page of 100 rows, which would otherwise silently drop games' odds."""
+    rows = []
+    cursor = None
+    for _ in range(20):  # safety cap on pages
+        params = {"dates": date_str, "per_page": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        resp = requests.get(f"{BDL_BASE}/odds", headers=_headers(),
+                            params=params, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+        rows.extend(payload.get("data", []))
+        cursor = (payload.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+
+    def to_float(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
 
     by_game = {}
     for o in rows:
@@ -81,11 +100,9 @@ def get_odds_for_date(date_str):
             by_game[gid]["home_ml"].append(o["moneyline_home_odds"])
         if o.get("moneyline_away_odds") is not None:
             by_game[gid]["away_ml"].append(o["moneyline_away_odds"])
-        if o.get("total_value") is not None:
-            try:
-                by_game[gid]["total"].append(float(o["total_value"]))
-            except (TypeError, ValueError):
-                pass
+        tv = to_float(o.get("total_value"))
+        if tv is not None:
+            by_game[gid]["total"].append(tv)
 
     consensus = {}
     for gid, v in by_game.items():
@@ -101,20 +118,46 @@ def get_odds_for_date(date_str):
     return consensus
 
 
-def match_odds_to_game(bdl_games, consensus, home_team_name, away_team_name):
-    """Find the balldontlie game whose teams match a Stats API game (by name
-    substring, since the two sources format names slightly differently) and
-    return its consensus odds, or None if no match / no odds."""
-    def norm(s):
-        return (s or "").lower().replace("é", "e")
+def _canonical_team(name):
+    """Reduce any team name format ('New York Yankees', 'Yankees', 'NYY',
+    'NY Yankees') to a single canonical key by matching the MLB nickname.
+    This avoids the 'Red Sox' vs 'White Sox' last-word collision that a naive
+    match hits (both end in 'Sox')."""
+    n = (name or "").lower().replace("é", "e").strip()
+    # Order matters: check multi-word nicknames before single words.
+    nicknames = [
+        "red sox", "white sox", "blue jays", "diamondbacks",
+        "yankees", "mets", "dodgers", "giants", "padres", "angels", "athletics",
+        "mariners", "rangers", "astros", "royals", "twins", "guardians",
+        "tigers", "brewers", "cubs", "cardinals", "pirates", "reds", "braves",
+        "marlins", "nationals", "phillies", "rockies", "orioles", "rays",
+    ]
+    for nick in nicknames:
+        if nick in n:
+            return nick
+    # Fall back to the raw normalized string if no nickname matched.
+    return n
 
+
+def _bdl_team_names(g, side):
+    """Pull whatever team-name fields a balldontlie game exposes for one side."""
+    flat = g.get(f"{side}_team_name")
+    obj = g.get(f"{side}_team", {}) or {}
+    return [flat, obj.get("name"), obj.get("display_name"), obj.get("location")]
+
+
+def _game_matches(g, home_name, away_name):
+    home_key, away_key = _canonical_team(home_name), _canonical_team(away_name)
+    bdl_home = {_canonical_team(x) for x in _bdl_team_names(g, "home") if x}
+    bdl_away = {_canonical_team(x) for x in _bdl_team_names(g, "away") if x}
+    return home_key in bdl_home and away_key in bdl_away
+
+
+def match_odds_to_game(bdl_games, consensus, home_team_name, away_team_name):
+    """Find the balldontlie game whose teams match a Stats API game and return
+    its consensus odds, or None if no match / no odds."""
     for g in bdl_games:
-        h = norm(g.get("home_team_name") or g.get("home_team", {}).get("name"))
-        a = norm(g.get("away_team_name") or g.get("away_team", {}).get("name"))
-        hn, an = norm(home_team_name), norm(away_team_name)
-        home_match = h and (h in hn or hn in h or h.split()[-1] == hn.split()[-1])
-        away_match = a and (a in an or an in a or a.split()[-1] == an.split()[-1])
-        if home_match and away_match:
+        if _game_matches(g, home_team_name, away_team_name):
             return consensus.get(g.get("id"))
     return None
 
