@@ -37,23 +37,42 @@ def format_first_pitch(game_date_utc):
     return dt.strftime("%I:%M %p ET").lstrip("0")
 
 
-def find_bdl_game_id(bdl_games, home_team_name, away_team_name):
-    """Return the balldontlie game id whose teams match a Stats API game, so we
-    can request that game's player props. Uses the same canonical-name matcher
-    as the odds, so 'New York Yankees' resolves to balldontlie's 'Yankees' and
-    'Red Sox' never collides with 'White Sox'."""
-    try:
-        from mlb_odds import _game_matches
-        for g in bdl_games:
+def find_bdl_game(bdl_games, home_team_name, away_team_name):
+    """Return the full balldontlie game object matching a Stats API game (so we
+    can read both its id and its team ids), or None. Errors are printed (not
+    swallowed) so a failure shows up in the Action log instead of silently
+    disabling props/box scores for every game."""
+    from mlb_odds import _game_matches
+    for g in (bdl_games or []):
+        try:
             if _game_matches(g, home_team_name, away_team_name):
-                return g.get("id")
-    except Exception:
-        pass
+                return g
+        except Exception as e:
+            print(f"    game-match error for {away_team_name} @ {home_team_name}: {e}")
     return None
 
 
+def find_bdl_game_id(bdl_games, home_team_name, away_team_name):
+    g = find_bdl_game(bdl_games, home_team_name, away_team_name)
+    return g.get("id") if g else None
+
+
+def _bdl_team_ids(bdl_game):
+    """Extract (home_team_id, away_team_id) from a balldontlie game object,
+    tolerating either flat ids or nested team objects."""
+    if not bdl_game:
+        return None, None
+    def tid(side):
+        v = bdl_game.get(f"{side}_team_id")
+        if v is not None:
+            return v
+        obj = bdl_game.get(f"{side}_team")
+        return obj.get("id") if isinstance(obj, dict) else None
+    return tid("home"), tid("away")
+
+
 def build_games(date_str, season, odds_available=False, bdl_games=None,
-                consensus=None, props_fn=None):
+                consensus=None, props_fn=None, boxscore_fn=None):
     print(f"Fetching schedule for {date_str}...")
     schedule = get_schedule(date_str)
     standings = get_standings(season)
@@ -118,13 +137,28 @@ def build_games(date_str, season, odds_available=False, bdl_games=None,
 
         # --- Player props (balldontlie) --------------------------------------
         prop_leans = []
+        box = {}
         if props_fn is not None:
-            bdl_game_id = find_bdl_game_id(bdl_games or [], home_name, away_name)
+            bdl_game = find_bdl_game(bdl_games or [], home_name, away_name)
+            bdl_game_id = bdl_game.get("id") if bdl_game else None
             if bdl_game_id is not None:
                 try:
                     prop_leans = props_fn(bdl_game_id, season)
                 except Exception as e:
                     print(f"    props unavailable for this game ({e})")
+                # Predicted box score (expected values). Needs bdl team ids.
+                if boxscore_fn is not None:
+                    try:
+                        home_tid, away_tid = _bdl_team_ids(bdl_game)
+                        if home_tid and away_tid:
+                            box = boxscore_fn(
+                                bdl_game_id, home_tid, away_tid, season,
+                                home_park_factor=park_factor,
+                                home_sp_era=home_era if home_era is not None else 4.5,
+                                away_sp_era=away_era if away_era is not None else 4.5,
+                            )
+                    except Exception as e:
+                        print(f"    box score unavailable for this game ({e})")
 
         rows.append({
             "Date": date_str,
@@ -146,6 +180,7 @@ def build_games(date_str, season, odds_available=False, bdl_games=None,
             "Pick Type": pick_type,
             "Confidence": confidence_label(conf_source),
             "Props": prop_leans,
+            "Box": box,
         })
     return rows
 
@@ -155,7 +190,7 @@ def write_csv(rows, path):
         return
     # Props are nested (a list per game); flatten them out of the CSV and into
     # a companion props CSV so Excel stays clean.
-    game_fields = [k for k in rows[0].keys() if k != "Props"]
+    game_fields = [k for k in rows[0].keys() if k not in ("Props", "Box")]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=game_fields, extrasaction="ignore")
         writer.writeheader()
@@ -266,6 +301,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .lean-under{color:var(--red);font-weight:600;}
   .lean-none{color:var(--ink-dim);}
   .props-note{font-size:10px;color:var(--ink-dim);margin-top:8px;font-style:italic;line-height:1.5;}
+  .box{display:none;padding:0 18px 16px;}
+  .box.open{display:block;}
+  .box-score-line{font-size:13px;color:var(--ink);padding:8px 0;border-bottom:1px solid var(--line);margin-bottom:8px;}
+  .box-team-label{font-family:'Oswald',sans-serif;font-size:14px;color:var(--amber);margin:10px 0 4px;text-transform:uppercase;letter-spacing:.03em;}
+  .box-src{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--ink-dim);text-transform:none;letter-spacing:0;margin-left:6px;font-style:italic;}
+  .box-table{width:100%;border-collapse:collapse;font-size:11px;}
+  .box-table th{text-align:right;color:var(--ink-dim);font-weight:500;padding:3px 6px;border-bottom:1px solid var(--line);}
+  .box-table th:first-child{text-align:left;}
+  .box-table td{text-align:right;padding:3px 6px;border-bottom:1px solid rgba(39,69,57,.3);}
+  .box-table td:first-child{text-align:left;}
+  .box-name{color:var(--ink);}
+  .box-empty{font-size:11px;color:var(--ink-dim);font-style:italic;padding:6px 0;}
   .details{display:none;padding:0 18px 16px;font-size:12px;color:var(--ink-dim);gap:6px;}
   .details.open{display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;}
   .toggle{cursor:pointer;color:var(--amber);font-size:11px;text-decoration:underline;background:none;border:none;
@@ -363,6 +410,37 @@ function propsSection(g, idx){
     </div>`;
 }
 
+function boxSection(g, idx){
+  const box = g["Box"] || {};
+  if (!box.available) return "";
+  const home = box.home || {}, away = box.away || {};
+  const batTable = (batters) => {
+    if (!batters || !batters.length) return '<div class="box-empty">No lineup data</div>';
+    const rows = batters.map(b => `<tr>
+      <td class="box-name">${b.name}</td>
+      <td>${b.AB}</td><td>${b.H}</td><td>${b.R}</td><td>${b.RBI}</td>
+      <td>${b.HR}</td><td>${b.BB}</td><td>${b.K}</td>
+    </tr>`).join("");
+    return `<table class="box-table">
+      <thead><tr><th>Batter</th><th>AB</th><th>H</th><th>R</th><th>RBI</th><th>HR</th><th>BB</th><th>K</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  };
+  const runs = (away.runs != null && home.runs != null)
+    ? `<div class="box-score-line">Projected runs — <b>${g["Away Team"]} ${away.runs}</b> &middot; <b>${g["Home Team"]} ${home.runs}</b></div>`
+    : "";
+  const src = box.lineup_source ? `<span class="box-src">${box.lineup_source}</span>` : "";
+  return `<button class="toggle box-toggle" data-b="${idx}">+ predicted box score</button>
+    <div class="box" id="box-${idx}">
+      ${runs}
+      <div class="box-team-label">${g["Away Team"]} ${src}</div>
+      ${batTable(away.batters)}
+      <div class="box-team-label">${g["Home Team"]}</div>
+      ${batTable(home.batters)}
+      <div class="props-note">Expected values from season rate stats adjusted for the opposing starter and park — these are per-game averages, NOT a prediction of tonight's actual line. Unbacktested; context only, not a betting signal.</div>
+    </div>`;
+}
+
+
 games.forEach((g, idx) => {
   const homeWin = g["Model Home Win%"], awayWin = g["Model Away Win%"];
   const card = document.createElement('div');
@@ -407,11 +485,19 @@ games.forEach((g, idx) => {
       <span>Market (de-vig): ${g["Market Away%"] != null ? g["Market Away%"]+"% / "+g["Market Home%"]+"%" : "no odds"}</span>
     </div>
     ${propsSection(g, idx)}
+    ${boxSection(g, idx)}
   `;
   board.appendChild(card);
 });
 
 board.addEventListener('click', (e) => {
+  if (e.target.classList.contains('box-toggle')) {
+    const d = document.getElementById('box-' + e.target.dataset.b);
+    d.classList.toggle('open');
+    const base = e.target.textContent.replace(/^[-+] /, '');
+    e.target.textContent = (d.classList.contains('open') ? '- ' : '+ ') + base;
+    return;
+  }
   if (e.target.classList.contains('props-toggle')) {
     const d = document.getElementById('props-' + e.target.dataset.p);
     d.classList.toggle('open');
@@ -442,7 +528,6 @@ def main():
     # Try to load real betting odds from balldontlie. If the key is missing or
     # the call fails, we degrade gracefully to straight-winner picks.
     odds_available, bdl_games, consensus = False, None, None
-    props_fn = None
     try:
         from mlb_odds import get_games_for_date, get_odds_for_date
         print("Fetching betting odds from balldontlie...")
@@ -456,6 +541,7 @@ def main():
 
     # Player props are optional; only wire them in if the module imports and a
     # key is present. Each game fetches its own props inside build_games.
+    props_fn = None
     try:
         from mlb_props import build_prop_leans
         props_fn = build_prop_leans
@@ -463,8 +549,18 @@ def main():
     except Exception as e:
         print(f"Player props unavailable ({e}).")
 
+    # Predicted (expected-value) box score, also optional.
+    boxscore_fn = None
+    try:
+        from mlb_boxscore import build_boxscore
+        boxscore_fn = build_boxscore
+        print("Predicted box score enabled.")
+    except Exception as e:
+        print(f"Box score unavailable ({e}).")
+
     rows = build_games(date_str, season, odds_available=odds_available,
-                       bdl_games=bdl_games, consensus=consensus, props_fn=props_fn)
+                       bdl_games=bdl_games, consensus=consensus,
+                       props_fn=props_fn, boxscore_fn=boxscore_fn)
     if not rows:
         print("No games found for tonight.")
         return
