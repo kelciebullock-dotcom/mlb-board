@@ -72,7 +72,7 @@ def _bdl_team_ids(bdl_game):
 
 
 def build_games(date_str, season, odds_available=False, bdl_games=None,
-                consensus=None, props_fn=None, boxscore_fn=None):
+                consensus=None, props_fn=None, boxscore_fn=None, book_odds=None):
     print(f"Fetching schedule for {date_str}...")
     schedule = get_schedule(date_str)
     standings = get_standings(season)
@@ -160,6 +160,19 @@ def build_games(date_str, season, odds_available=False, bdl_games=None,
                     except Exception as e:
                         print(f"    box score unavailable for this game ({e})")
 
+        # --- Line shopping / discrepancy scan --------------------------------
+        shopping = {}
+        if book_odds:
+            bdl_g = find_bdl_game(bdl_games or [], home_name, away_name)
+            gid = bdl_g.get("id") if bdl_g else None
+            rows_for_game = book_odds.get(gid) if gid is not None else None
+            if rows_for_game:
+                try:
+                    from mlb_shopping import analyze_game_books
+                    shopping = analyze_game_books(rows_for_game)
+                except Exception as e:
+                    print(f"    shopping analysis failed ({e})")
+
         rows.append({
             "Date": date_str,
             "First Pitch (ET)": format_first_pitch(g.get("gameDate", "")),
@@ -181,6 +194,7 @@ def build_games(date_str, season, odds_available=False, bdl_games=None,
             "Confidence": confidence_label(conf_source),
             "Props": prop_leans,
             "Box": box,
+            "Shopping": shopping,
         })
     return rows
 
@@ -190,7 +204,7 @@ def write_csv(rows, path):
         return
     # Props are nested (a list per game); flatten them out of the CSV and into
     # a companion props CSV so Excel stays clean.
-    game_fields = [k for k in rows[0].keys() if k not in ("Props", "Box")]
+    game_fields = [k for k in rows[0].keys() if k not in ("Props", "Box", "Shopping")]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=game_fields, extrasaction="ignore")
         writer.writeheader()
@@ -313,6 +327,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .box-table td:first-child{text-align:left;}
   .box-name{color:var(--ink);}
   .box-empty{font-size:11px;color:var(--ink-dim);font-style:italic;padding:6px 0;}
+  .best-price{font-size:12px;color:var(--ink);padding:8px 0;border-bottom:1px solid var(--line);margin-bottom:8px;}
+  .best-price b{color:var(--amber);}
+  .book-tag{font-size:10px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:.03em;}
+  .discrepancy{background:rgba(242,169,59,.12);border:1px solid rgba(242,169,59,.3);border-radius:4px;
+               padding:8px 10px;font-size:11px;color:var(--amber);margin-bottom:10px;line-height:1.5;}
+  .age-cell{color:var(--ink-dim);font-size:10px;}
   .details{display:none;padding:0 18px 16px;font-size:12px;color:var(--ink-dim);gap:6px;}
   .details.open{display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;}
   .toggle{cursor:pointer;color:var(--amber);font-size:11px;text-decoration:underline;background:none;border:none;
@@ -440,6 +460,40 @@ function boxSection(g, idx){
     </div>`;
 }
 
+function shoppingSection(g, idx){
+  const s = g["Shopping"] || {};
+  if (!s.all_books || !s.all_books.length) return "";
+  const fmt = v => v == null ? "—" : (v > 0 ? "+"+v : ""+v);
+  const bookRows = s.all_books.map(b => {
+    const age = b.age_min != null ? b.age_min+"m" : "—";
+    return `<tr>
+      <td class="box-name">${b.vendor || "—"}</td>
+      <td>${fmt(b.away_ml)}</td><td>${fmt(b.home_ml)}</td>
+      <td>${b.total != null ? b.total : "—"}</td><td class="age-cell">${age}</td>
+    </tr>`;
+  }).join("");
+  const bestLine = `<div class="best-price">Best price — away <b>${g["Away Team"]}</b> ${fmt(s.best_away_ml)} <span class="book-tag">${s.best_away_book||""}</span> &middot; home <b>${g["Home Team"]}</b> ${fmt(s.best_home_ml)} <span class="book-tag">${s.best_home_book||""}</span></div>`;
+  let flag = "";
+  const hd = s.home_discrepancy_pts, ad = s.away_discrepancy_pts;
+  if (hd != null || ad != null){
+    const parts = [];
+    if (ad != null) parts.push(`away side +${ad}pts vs market`);
+    if (hd != null) parts.push(`home side +${hd}pts vs market`);
+    flag = `<div class="discrepancy">⚑ Off-market book detected: ${parts.join(" · ")}. Worth a look — may be a slow line, or just a different opinion. Not a pick.</div>`;
+  }
+  const count = (hd != null || ad != null) ? "off-market flag" : `${s.num_books} books`;
+  return `<button class="toggle shop-toggle" data-s="${idx}">+ line shopping (${count})</button>
+    <div class="box" id="shop-${idx}">
+      ${bestLine}
+      ${flag}
+      <table class="box-table">
+        <thead><tr><th>Book</th><th>Away ML</th><th>Home ML</th><th>Total</th><th>Age</th></tr></thead>
+        <tbody>${bookRows}</tbody>
+      </table>
+      <div class="props-note">Best price = the highest payout available across books right now — betting the best number is the one repeatable retail edge. "Off-market" flags a book far from consensus; the Age column shows minutes since that book last updated. Verify before betting; lines move.</div>
+    </div>`;
+}
+
 
 games.forEach((g, idx) => {
   const homeWin = g["Model Home Win%"], awayWin = g["Model Away Win%"];
@@ -486,11 +540,19 @@ games.forEach((g, idx) => {
     </div>
     ${propsSection(g, idx)}
     ${boxSection(g, idx)}
+    ${shoppingSection(g, idx)}
   `;
   board.appendChild(card);
 });
 
 board.addEventListener('click', (e) => {
+  if (e.target.classList.contains('shop-toggle')) {
+    const d = document.getElementById('shop-' + e.target.dataset.s);
+    d.classList.toggle('open');
+    const base = e.target.textContent.replace(/^[-+] /, '');
+    e.target.textContent = (d.classList.contains('open') ? '- ' : '+ ') + base;
+    return;
+  }
   if (e.target.classList.contains('box-toggle')) {
     const d = document.getElementById('box-' + e.target.dataset.b);
     d.classList.toggle('open');
@@ -558,9 +620,19 @@ def main():
     except Exception as e:
         print(f"Box score unavailable ({e}).")
 
+    # Line shopping / discrepancy scan: all books' prices per game (not averaged).
+    book_odds = None
+    try:
+        from mlb_shopping import get_all_book_odds
+        print("Fetching per-book odds for line shopping...")
+        book_odds = get_all_book_odds(date_str)
+        print(f"Loaded per-book odds for {len(book_odds)} games.")
+    except Exception as e:
+        print(f"Line shopping unavailable ({e}).")
+
     rows = build_games(date_str, season, odds_available=odds_available,
                        bdl_games=bdl_games, consensus=consensus,
-                       props_fn=props_fn, boxscore_fn=boxscore_fn)
+                       props_fn=props_fn, boxscore_fn=boxscore_fn, book_odds=book_odds)
     if not rows:
         print("No games found for tonight.")
         return
