@@ -73,6 +73,7 @@ def get_team_regulars(team_id, season, limit=9):
     except Exception:
         return []
     players = []
+    dropped_wrong_team = 0
     for s in resp.json().get("data", []):
         gp = s.get("batting_gp") or 0
         if gp < 1:
@@ -81,16 +82,39 @@ def get_team_regulars(team_id, season, limit=9):
         pid = player.get("id")
         if pid is None:
             continue
-        # Defensive: only keep players actually on this team, in case the API
-        # returns extras. The player's team is nested under player.team.
-        row_team_id = (player.get("team") or {}).get("id")
-        if row_team_id is not None and row_team_id != team_id:
-            continue
         name = player.get("full_name") or \
             (f'{player.get("first_name","")} {player.get("last_name","")}'.strip())
+        # The corrected `team_id` query param (above) is what actually filters by
+        # team. We record the player's own team id when present, but we do NOT
+        # hard-drop on it here: in some responses player.team is absent, and a
+        # hard filter would wrongly discard everyone and blank the box score.
+        row_team_id = (player.get("team") or {}).get("id")
+        if row_team_id is not None and row_team_id != team_id:
+            dropped_wrong_team += 1
+            continue
         players.append({"player_id": pid, "name": name or f"Player {pid}",
                         "gp": gp, "stat": s})
+
+    # Safety net: if the team-id check dropped players but left us with nothing
+    # (e.g. player.team is populated with an unexpected id shape), fall back to
+    # trusting the API's own team_id filter and keep the raw batters.
+    if not players and dropped_wrong_team:
+        for s in resp.json().get("data", []):
+            gp = s.get("batting_gp") or 0
+            if gp < 1:
+                continue
+            player = s.get("player") or {}
+            pid = player.get("id")
+            if pid is None:
+                continue
+            name = player.get("full_name") or \
+                (f'{player.get("first_name","")} {player.get("last_name","")}'.strip())
+            players.append({"player_id": pid, "name": name or f"Player {pid}",
+                            "gp": gp, "stat": s})
     players.sort(key=lambda p: p["gp"], reverse=True)
+    if not players:
+        print(f"    box score: team {team_id} returned no batters "
+              f"(season_stats empty for season {season}?)")
     return players[:limit]
 
 
