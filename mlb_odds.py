@@ -140,9 +140,13 @@ def _canonical_team(name):
 
 
 def _bdl_team_names(g, side):
-    """Pull whatever team-name fields a balldontlie game exposes for one side."""
+    """Pull whatever team-name fields a balldontlie game exposes for one side.
+    Guards against the team object being null or a non-dict, which would
+    otherwise raise and (previously) silently disable matching."""
     flat = g.get(f"{side}_team_name")
-    obj = g.get(f"{side}_team", {}) or {}
+    obj = g.get(f"{side}_team")
+    if not isinstance(obj, dict):
+        obj = {}
     return [flat, obj.get("name"), obj.get("display_name"), obj.get("location")]
 
 
