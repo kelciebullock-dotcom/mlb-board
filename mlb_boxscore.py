@@ -58,10 +58,15 @@ def get_lineup(game_id, team_id):
 
 def get_team_regulars(team_id, season, limit=9):
     """Fallback lineup: a team's most-used batters this season, by games played.
-    Always available even when no lineup is posted."""
+    Always available even when no lineup is posted.
+
+    NOTE: the /season_stats endpoint filters by the SINGULAR `team_id` param
+    (not team_ids[]). Passing the wrong param name makes the API ignore the
+    filter and return unfiltered players — which put the wrong players on each
+    team. We also defensively re-check each row's team id below."""
     try:
         resp = requests.get(f"{BDL_BASE}/season_stats", headers=_headers(),
-                            params=[("season", season), ("team_ids[]", team_id),
+                            params=[("season", season), ("team_id", team_id),
                                     ("per_page", 100)], timeout=20)
         if resp.status_code != 200:
             return []
@@ -75,6 +80,11 @@ def get_team_regulars(team_id, season, limit=9):
         player = s.get("player") or {}
         pid = player.get("id")
         if pid is None:
+            continue
+        # Defensive: only keep players actually on this team, in case the API
+        # returns extras. The player's team is nested under player.team.
+        row_team_id = (player.get("team") or {}).get("id")
+        if row_team_id is not None and row_team_id != team_id:
             continue
         name = player.get("full_name") or \
             (f'{player.get("first_name","")} {player.get("last_name","")}'.strip())
